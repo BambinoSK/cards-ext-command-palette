@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "CardsExtension (Package)": {
+      "commandName": "MsixPackage",
+      "doNotLaunchApp": true
+    },
+    "CardsExtension (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
