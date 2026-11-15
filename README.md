@@ -67,7 +67,7 @@ Browse and manage your Trello boards, lists and cards from PowerToys Command Pal
 
 ## Install
 
-**Microsoft Store:** coming soon. The Store link will be added here when the listing is live.
+**Microsoft Store:** [Get Cards For Command Palette](https://apps.microsoft.com/detail/9NPG5G5QJFTC)
 
 After installing, open Command Palette and search for **Cards**.
 
