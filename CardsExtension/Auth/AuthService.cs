@@ -240,11 +240,12 @@ internal sealed class AuthService
     }
 
     /// <summary>
-    /// Accepts one HTTP GET on the loopback listener (the browser redirect after the
-    /// user clicks Allow), answers with a minimal HTML page, validates state, and
-    /// exchanges the authorization code for tokens. Verified from the docs: the code
-    /// arrives in the "code" query parameter; exchange is a JSON POST to the token
-    /// endpoint with client_id, grant_type, redirect_uri, code, code_verifier.
+    /// Waits for the browser redirect on the loopback listener (the GET the browser
+    /// makes after the user clicks Allow), answers it with a minimal HTML page,
+    /// validates state, and exchanges the authorization code for tokens. Verified
+    /// from the docs: the code arrives in the "code" query parameter; exchange is a
+    /// JSON POST to the token endpoint with client_id, grant_type, redirect_uri,
+    /// code, code_verifier.
     /// </summary>
     private async Task<OAuthSignInResult> AcceptCallbackAsync(System.Net.Sockets.TcpListener listener, AuthRequest request)
     {
@@ -257,93 +258,46 @@ internal sealed class AuthService
         var timeoutCts = _pendingCts!;
         var ctsCaptured = timeoutCts;
 
+        // Scope for the accept loop and connection handlers; cancelled in finally.
+        CancellationTokenSource? connectionsCts = null;
+
         try
         {
-            string? code = null;
-            string? returnedState = null;
-            string? callbackError = null;
+            connectionsCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
 
-            // Accept connections until we get the actual redirect request. A browser
-            // may open multiple connections (pre-connect probes, favicon, etc.) -
-            // anything without a code is answered with the fallback page and skipped.
-            while (code is null && callbackError is null)
+            // Completed by the first connection carrying a code or an error. Connections run
+            // concurrently so an idle browser pre-connect cannot block the real redirect.
+            var callback = new TaskCompletionSource<CallbackParams>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _ = AcceptLoopAsync(listener, request, callback, connectionsCts.Token);
+
+            CallbackParams result;
+            try
             {
-                System.Net.Sockets.TcpClient client;
-                try
-                {
-                    client = await listener.AcceptTcpClientAsync(timeoutCts.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return OAuthSignInResult.Fail("Sign-in cancelled - the browser never reached the local callback. Try connecting again.");
-                }
-
-                using (client)
-                {
-                    var stream = client.GetStream();
-
-                    // Read the request head (request line + headers) - bounded so a
-                    // misbehaving client cannot hang us or blow memory.
-                    var buffer = new byte[8192];
-                    var head = new StringBuilder();
-                    while (!head.ToString().Contains("\r\n\r\n", StringComparison.Ordinal) && head.Length < buffer.Length)
-                    {
-                        var read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), timeoutCts.Token).ConfigureAwait(false);
-                        if (read == 0) break;
-                        head.Append(Encoding.ASCII.GetString(buffer, 0, read));
-                    }
-
-                    var requestHead = head.ToString();
-                    var firstLineEnd = requestHead.IndexOf("\r\n", StringComparison.Ordinal);
-                    if (firstLineEnd < 0) continue; // malformed request - drop connection, keep waiting
-
-                    // Request line: "GET /callback?code=…&state=… HTTP/1.1"
-                    var requestLine = requestHead[..firstLineEnd];
-                    var parts = requestLine.Split(' ');
-                    if (parts.Length < 2 || parts.Length > 0 && parts[0] != "GET") continue;
-                    var path = parts[1];
-
-                    var hasCode = TryGetQueryParam(path, "code", out code);
-                    TryGetQueryParam(path, "state", out returnedState);
-                    var hasError = TryGetQueryParam(path, "error", out callbackError);
-
-                    // Answer the browser once with a tiny static page (success or
-                    // error) so the tab doesn't hang on a pending connection.
-                    var ok = hasCode && callbackError is null;
-                    var html = BuildCallbackPage(ok);
-                    var responseBytes = Encoding.ASCII.GetBytes(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " +
-                        Encoding.UTF8.GetByteCount(html) + "\r\n\r\n" + html);
-                    await stream.WriteAsync(responseBytes, timeoutCts.Token).ConfigureAwait(false);
-                    await stream.FlushAsync(timeoutCts.Token).ConfigureAwait(false);
-
-                    if (!hasCode && !hasError)
-                    {
-                        // Probe/favicon request without a code - keep waiting for
-                        // the real redirect on the next accepted connection.
-                        code = null;
-                    }
-                }
+                result = await callback.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return OAuthSignInResult.Fail("Sign-in cancelled - the browser never reached the local callback. Try connecting again.");
             }
 
-            if (callbackError is not null)
+            if (result.Error is not null)
             {
-                return OAuthSignInResult.Fail($"Trello returned an error: {callbackError}");
+                return OAuthSignInResult.Fail($"Trello returned an error: {result.Error}");
             }
 
-            if (code is null)
+            if (result.Code is null)
             {
                 return OAuthSignInResult.Fail("The sign-in response did not contain an authorization code. Try connecting again.");
             }
 
             // Validate state BEFORE exchanging (CSRF protection).
-            if (!string.Equals(returnedState, request.State, StringComparison.Ordinal))
+            if (!string.Equals(result.State, request.State, StringComparison.Ordinal))
             {
                 return OAuthSignInResult.Fail("Sign-in state did not match - the response may have been tampered with. Try connecting again.");
             }
 
             // Exchange the code for tokens.
-            var tokens = await ExchangeCodeAsync(code, request).ConfigureAwait(false);
+            var tokens = await ExchangeCodeAsync(result.Code, request).ConfigureAwait(false);
             SaveTokens(tokens);
             return OAuthSignInResult.Success();
         }
@@ -354,7 +308,10 @@ internal sealed class AuthService
         finally
         {
             PendingRequest = null;
+            // Cancel before Stop so the accept loop ends via cancellation, not a socket error.
+            connectionsCts?.Cancel();
             listener.Stop();
+            connectionsCts?.Dispose();
             // The handshake is over (success, failure, timeout, or cancel) -
             // dispose THIS sign-in's captured CTS (by value, not the field: a
             // fast re-invoke may have already installed a new sign-in's CTS in
@@ -364,6 +321,106 @@ internal sealed class AuthService
             {
                 _pendingCts = null;
             }
+        }
+    }
+
+    private readonly record struct CallbackParams(string? Code, string? State, string? Error);
+
+    /// <summary>How long a loopback connection may take to send its request head.</summary>
+    private static readonly TimeSpan CallbackConnectionTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>Accepts loopback connections until cancelled, handling each concurrently.</summary>
+    private static async Task AcceptLoopAsync(
+        System.Net.Sockets.TcpListener listener,
+        AuthRequest request,
+        TaskCompletionSource<CallbackParams> callback,
+        CancellationToken ct)
+    {
+        try
+        {
+            while (true)
+            {
+                var client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
+                _ = HandleCallbackConnectionAsync(client, request, callback, ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Handshake ended.
+        }
+        catch (Exception ex)
+        {
+            callback.TrySetException(ex);
+        }
+    }
+
+    /// <summary>
+    /// Answers one loopback GET and completes <paramref name="callback"/> if it carries a code or an
+    /// error. Never throws: probes and broken connections are dropped.
+    /// </summary>
+    private static async Task HandleCallbackConnectionAsync(
+        System.Net.Sockets.TcpClient client,
+        AuthRequest request,
+        TaskCompletionSource<CallbackParams> callback,
+        CancellationToken ct)
+    {
+        try
+        {
+            using (client)
+            using (var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                connectionCts.CancelAfter(CallbackConnectionTimeout);
+                var token = connectionCts.Token;
+                var stream = client.GetStream();
+
+                // Request head, bounded in size and time.
+                var buffer = new byte[8192];
+                var head = new StringBuilder();
+                while (!head.ToString().Contains("\r\n\r\n", StringComparison.Ordinal) && head.Length < buffer.Length)
+                {
+                    var read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false);
+                    if (read == 0) break;
+                    head.Append(Encoding.ASCII.GetString(buffer, 0, read));
+                }
+
+                var requestHead = head.ToString();
+                var firstLineEnd = requestHead.IndexOf("\r\n", StringComparison.Ordinal);
+                if (firstLineEnd < 0) return; // malformed request - drop the connection
+
+                // Request line: "GET /callback?code=…&state=… HTTP/1.1"
+                var parts = requestHead[..firstLineEnd].Split(' ');
+                if (parts.Length < 2 || parts[0] != "GET") return;
+                var path = parts[1];
+
+                var hasCode = TryGetQueryParam(path, "code", out var code);
+                TryGetQueryParam(path, "state", out var returnedState);
+                var hasError = TryGetQueryParam(path, "error", out var callbackError);
+
+                // The success page is shown only if the state matches.
+                var stateOk = string.Equals(returnedState, request.State, StringComparison.Ordinal);
+                var html = BuildCallbackPage(hasCode && !hasError && stateOk);
+                var responseBytes = Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " +
+                    Encoding.UTF8.GetByteCount(html) + "\r\n\r\n" + html);
+
+                try
+                {
+                    await stream.WriteAsync(responseBytes, token).ConfigureAwait(false);
+                    await stream.FlushAsync(token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    // Reported after answering, because completing the handshake cancels this token.
+                    if (hasCode || hasError)
+                    {
+                        callback.TrySetResult(new CallbackParams(hasError ? null : code, returnedState, callbackError));
+                    }
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // Stalled, reset or cancelled connection.
         }
     }
 
@@ -477,20 +534,22 @@ internal sealed class AuthService
                         throw new InvalidOperationException("Signed out during token refresh");
                     }
 
-                    refreshTask = RefreshAsync(current.RefreshToken, generation, ct);
+                    refreshTask = RefreshAsync(current.RefreshToken, generation);
                     _refreshTask = refreshTask;
                 }
             }
         }
 
-        return await refreshTask.ConfigureAwait(false);
+        // The refresh is shared, so it ignores any one caller's token; callers only stop waiting.
+        return await refreshTask.WaitAsync(ct).ConfigureAwait(false);
     }
 
     private volatile Task<string>? _refreshTask;
     private readonly object _refreshLock = new();
     private int _generation;
 
-    private async Task<string> RefreshAsync(string refreshToken, int generation, CancellationToken ct)
+    // No CancellationToken: the refresh is shared (see GetValidAccessTokenAsync); TokenHttp's timeout bounds it.
+    private async Task<string> RefreshAsync(string refreshToken, int generation)
     {
         // Verified refresh request (Confidential Client Usage, Step 4): client_id,
         // grant_type=refresh_token, refresh_token. Public client → no client_secret.
@@ -503,7 +562,7 @@ internal sealed class AuthService
         };
 
         using var content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
-        using var response = await TokenHttp.PostAsync(TokenEndpoint, content, ct).ConfigureAwait(false);
+        using var response = await TokenHttp.PostAsync(TokenEndpoint, content).ConfigureAwait(false);
         var tokens = await ReadTokensAsync(response).ConfigureAwait(false);
 
         // Guard: if SignOut() ran during the refresh, do not resurrect credentials.

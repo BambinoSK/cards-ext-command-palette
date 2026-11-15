@@ -25,6 +25,9 @@ internal sealed partial class BoardListPage : DynamicListPage, IDisposable
     private readonly CardsService _cardsService;
     private List<CardsBoard> _boards = [];
     private string _errorMessage = string.Empty;
+    // When the boards were last loaded (or a load was last attempted).
+    private DateTime _lastLoadTime = DateTime.MinValue;
+    private static readonly TimeSpan StaleThreshold = TimeSpan.FromSeconds(60);
 
     // logo PNG asset
     private static readonly IconInfo CardsIcon =
@@ -109,12 +112,19 @@ internal sealed partial class BoardListPage : DynamicListPage, IDisposable
             ];
         }
 
+        // ── Stale refresh ────────────────────────────────────────────────────
+        // IsLoading is set synchronously, so this also prevents stacking loads.
+        if (!IsLoading && DateTime.UtcNow - _lastLoadTime > StaleThreshold)
+        {
+            LoadBoardsInBackground();
+        }
+
         // ── API error ────────────────────────────────────────────────────────
         if (!string.IsNullOrEmpty(_errorMessage))
         {
             return
             [
-                new ListItem(new NoOpCommand())
+                new ListItem(new AnonymousCommand(RetryLoad) { Name = "Retry", Result = CommandResult.KeepOpen() })
                 {
                     Title = "Failed to load boards",
                     Subtitle = _errorMessage,
@@ -216,13 +226,23 @@ internal sealed partial class BoardListPage : DynamicListPage, IDisposable
     {
         _boards = [];
         _errorMessage = string.Empty;
+        // Forces a reload on the next render after signing back in.
+        _lastLoadTime = DateTime.MinValue;
         RaiseItemsChanged();
+    }
+
+    private void RetryLoad()
+    {
+        if (!IsLoading)
+        {
+            LoadBoardsInBackground();
+        }
     }
 
     private void LoadBoardsInBackground()
     {
         IsLoading = true;
-        _errorMessage = string.Empty;
+        // _errorMessage is cleared on success only, so the error row stays while a retry runs.
 
         Task.Run(async () =>
         {
@@ -236,14 +256,20 @@ internal sealed partial class BoardListPage : DynamicListPage, IDisposable
                 }
                 open.Sort(static (a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Name, b.Name));
                 _boards = open;
+                _errorMessage = string.Empty;
             }
             catch (Exception ex)
             {
-                _boards = [];
-                _errorMessage = $"{ex.GetType().Name}: {ex.Message}";
+                // A failed refresh keeps the boards already shown; only an empty page reports the error.
+                if (_boards.Count == 0)
+                {
+                    _errorMessage = $"{ex.GetType().Name}: {ex.Message}";
+                }
             }
             finally
             {
+                // Also set on failure: the stale check retries only after StaleThreshold.
+                _lastLoadTime = DateTime.UtcNow;
                 IsLoading = false;
                 RaiseItemsChanged();
             }

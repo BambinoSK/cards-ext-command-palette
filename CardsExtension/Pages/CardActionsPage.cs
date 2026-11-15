@@ -101,14 +101,14 @@ internal sealed partial class CardActionsPage : ListPage
         // ── Move up / Move down - reposition within current list ─────────────
         // Verified: API uses fractional pos indexing; midpoint inserts between adjacent cards.
         // _orderedCards is sorted by pos ascending (top → bottom).
-        items.Add(new ListItem(new MoveCardUpCommand(_cardsService, _card, _orderedCards, _onActionCompleted))
+        items.Add(new ListItem(new MoveCardUpCommand(_cardsService, _card, () => _orderedCards, _onActionCompleted))
         {
             Title = "Move up",
             Subtitle = "Move this card toward the top of the list",
             Icon = new IconInfo("\uE74A"), // Up
         });
 
-        items.Add(new ListItem(new MoveCardDownCommand(_cardsService, _card, _orderedCards, _onActionCompleted))
+        items.Add(new ListItem(new MoveCardDownCommand(_cardsService, _card, () => _orderedCards, _onActionCompleted))
         {
             Title = "Move down",
             Subtitle = "Move this card toward the bottom of the list",

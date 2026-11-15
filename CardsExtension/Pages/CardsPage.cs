@@ -80,16 +80,34 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
     private static readonly TimeSpan StaleThreshold = TimeSpan.FromSeconds(30);
 
     // Lazy-loaded card details (checklists + members + attachments), cached per card ID.
-    // Fetched on first focus via BuildDetails; refreshes the list when complete.
+    // Fetched on first render via BuildDetails; refreshes the list when complete.
     // Uses ConcurrentDictionary for thread-safe access from both UI and background tasks.
-    private readonly ConcurrentDictionary<string, (List<CardsChecklist> Checklists, List<CardsMember> Members, List<CardsAttachment> Attachments)> _detailCache = [];
+    private readonly ConcurrentDictionary<string, CardDetails> _detailCache = [];
     private readonly ConcurrentDictionary<string, byte> _detailFetchInProgress = [];
+    // When a card's detail fetch last failed; missing kinds are retried after DetailRetryCooldown.
+    private readonly ConcurrentDictionary<string, DateTime> _detailFetchFailedAt = [];
+    private static readonly TimeSpan DetailRetryCooldown = TimeSpan.FromSeconds(30);
+    // Cancels queued and in-flight detail fetches. Replaced on ManualRefresh and cancelled on Dispose.
+    // Replaced sources are not disposed so a concurrent GetItems() can still read their Token.
+    private CancellationTokenSource _detailCts = new();
 
-    // Debounce timer for detail-fetch completions. Collapses multiple
-    // RaiseItemsChanged() calls (one per card) into a single list refresh
-    // after 500ms of quiet, preventing rapid selection jumps (PowerToys
-    // issue #48895) and the resulting intermittent Ctrl+Enter failures.
+    // Spreads detail fetches (up to 3 per card) under the API limit of 100 requests per 10 s per token.
+    // Static because the limit is per token: 30 at once, then 5 per second.
+    private static readonly RequestPacer DetailFetchPacer = new(capacity: 30, refillPerSecond: 5);
+
+    // Collapses detail-fetch completions into one list refresh (PowerToys #48895: refreshes
+    // make the selection jump). Fires after DetailRefreshQuietMs of quiet, or DetailRefreshMaxWaitMs
+    // after the first completion at the latest.
     private readonly Timer _detailRefreshDebounce;
+    private const long DetailRefreshQuietMs = 750;
+    private const long DetailRefreshMaxWaitMs = 2500;
+    private long _detailRefreshPendingSince;
+
+    /// <summary>Lazily fetched card details. A null list means not fetched or failed; an empty list means none.</summary>
+    private sealed record CardDetails(
+        List<CardsChecklist>? Checklists,
+        List<CardsMember>? Members,
+        List<CardsAttachment>? Attachments);
 
     public CardsPage(CardsService cardsService, CardsList list, IReadOnlyList<CardsList> allListsOnBoard)
     {
@@ -117,7 +135,15 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
         // with IncrementalRefresh = -2. This preserves selection after in-place
         // actions (move up/down, mark complete, etc.) so the host doesn't force
         // selection to the first row and lose the SecondaryCommand (Ctrl+Enter).
-        _detailRefreshDebounce = new Timer(_ => RaiseItemsChanged(-2), null, Timeout.Infinite, Timeout.Infinite);
+        _detailRefreshDebounce = new Timer(
+            _ =>
+            {
+                Interlocked.Exchange(ref _detailRefreshPendingSince, 0);
+                RaiseItemsChanged(-2);
+            },
+            null,
+            Timeout.Infinite,
+            Timeout.Infinite);
 
         // Deliberately NO LoadCardsInBackground() here. This page is constructed
         // for every row on every parent render (ListsPage.GetItems builds one
@@ -163,11 +189,12 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
             LoadCardsInBackground();
         }
 
+        // Enter on the error row retries.
         if (!string.IsNullOrEmpty(_errorMessage))
         {
             return
             [
-                new ListItem(new NoOpCommand())
+                new ListItem(new AnonymousCommand(RetryLoad) { Name = "Retry", Result = CommandResult.KeepOpen() })
                 {
                     Title = "Failed to load cards",
                     Subtitle = _errorMessage,
@@ -344,9 +371,12 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
             EnsureCardDetailsFetched(card.Id, fetchChecklists, fetchMembers, fetchAttachments);
         }
 
-        if (fetchMembers && _detailCache.TryGetValue(card.Id, out var cached) && cached.Members.Count > 0)
+        _detailCache.TryGetValue(card.Id, out var cached);
+        var detailsLoading = _detailFetchInProgress.ContainsKey(card.Id);
+
+        if (fetchMembers && cached?.Members is { Count: > 0 } cachedMembers)
         {
-            var memberNames = string.Join(", ", cached.Members.ConvertAll(m => m.DisplayText));
+            var memberNames = string.Join(", ", cachedMembers.ConvertAll(m => m.DisplayText));
             metaElements.Add(new DetailsElement
             {
                 Key = "Members",
@@ -381,9 +411,9 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
 
         if (fetchChecklists)
         {
-            if (_detailCache.TryGetValue(card.Id, out var cachedDetail) && cachedDetail.Checklists.Count > 0)
+            if (cached?.Checklists is { Count: > 0 } cachedChecklists)
             {
-                var checklistMarkdown = BuildChecklistMarkdown(cachedDetail.Checklists);
+                var checklistMarkdown = BuildChecklistMarkdown(cachedChecklists);
                 if (!string.IsNullOrEmpty(checklistMarkdown))
                 {
                     body = string.IsNullOrEmpty(body)
@@ -391,7 +421,7 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
                         : $"{body}\n\n{checklistMarkdown}";
                 }
             }
-            else if (_detailFetchInProgress.ContainsKey(card.Id))
+            else if (cached?.Checklists is null && detailsLoading)
             {
                 // Still loading - show a hint.
                 body = string.IsNullOrEmpty(body)
@@ -407,14 +437,14 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
         // called "readme_(v2).md" doesn't inject formatting/link syntax.
         if (fetchAttachments)
         {
-            if (_detailCache.TryGetValue(card.Id, out var cachedAtt) && cachedAtt.Attachments.Count > 0)
+            if (cached?.Attachments is { Count: > 0 } cachedAttachments)
             {
-                var attachmentMarkdown = BuildAttachmentMarkdown(cachedAtt.Attachments);
+                var attachmentMarkdown = BuildAttachmentMarkdown(cachedAttachments);
                 body = string.IsNullOrEmpty(body)
                     ? attachmentMarkdown
                     : $"{body}\n\n{attachmentMarkdown}";
             }
-            else if (_detailFetchInProgress.ContainsKey(card.Id))
+            else if (cached?.Attachments is null && detailsLoading)
             {
                 // Still loading - show a hint.
                 body = string.IsNullOrEmpty(body)
@@ -433,79 +463,143 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
     }
 
     /// <summary>
-    /// Lazily fetches checklists and/or members for a card if not yet cached.
+    /// Lazily fetches the enabled detail kinds a card does not have cached yet.
     /// Verified endpoints:
     ///   GET /1/cards/{id}/checklists?checkItem_fields=name,state,pos
     ///   GET /1/cards/{id}/members?fields=avatarHash,fullName,initials,username
+    ///   GET /1/cards/{id}/attachments
+    ///
+    /// Fetches per kind: a kind that failed, or was enabled later, is fetched again.
     /// </summary>
     private void EnsureCardDetailsFetched(string cardId, bool fetchChecklists, bool fetchMembers, bool fetchAttachments)
     {
-        if (_detailCache.ContainsKey(cardId) || _detailFetchInProgress.ContainsKey(cardId))
+        _detailCache.TryGetValue(cardId, out var cached);
+        var needChecklists = fetchChecklists && cached?.Checklists is null;
+        var needMembers = fetchMembers && cached?.Members is null;
+        var needAttachments = fetchAttachments && cached?.Attachments is null;
+        if (!needChecklists && !needMembers && !needAttachments)
             return;
 
-        _detailFetchInProgress.TryAdd(cardId, 0);
+        if (_detailFetchFailedAt.TryGetValue(cardId, out var failedAt) && DateTime.UtcNow - failedAt < DetailRetryCooldown)
+            return;
+
+        CancellationToken ct;
+        try
+        {
+            ct = Volatile.Read(ref _detailCts).Token;
+        }
+        catch (ObjectDisposedException)
+        {
+            return; // Page disposed.
+        }
+
+        if (ct.IsCancellationRequested)
+            return;
+
+        // TryAdd is the guard: only the caller that adds the marker fetches.
+        if (!_detailFetchInProgress.TryAdd(cardId, 0))
+            return;
+
+        // Reserved here, before the task starts, so cards are served in list order.
+        var requestCount = (needChecklists ? 1 : 0) + (needMembers ? 1 : 0) + (needAttachments ? 1 : 0);
+        var turn = DetailFetchPacer.WaitAsync(requestCount, ct);
 
         Task.Run(async () =>
         {
+            List<CardsChecklist>? checklists = null;
+            List<CardsMember>? members = null;
+            List<CardsAttachment>? attachments = null;
+
             try
             {
-                List<CardsChecklist> checklists = [];
-                List<CardsMember> members = [];
-                List<CardsAttachment> attachments = [];
+                await turn.ConfigureAwait(false);
 
-                // Kick off each enabled fetch independently. Each sub-task is
-                // individually try/catch-wrapped: Task.WhenAll aborts on the
-                // FIRST fault, and an unwrapped attachment failure would
-                // discard already-fetched members/checklists for this card.
-                // Wrapped tasks always complete successfully (null on failure),
-                // so WhenAll waits for all three regardless of individual
-                // outcomes and partial results are preserved.
-                var checklistTask = fetchChecklists ? FetchSafeAsync(_cardsService.GetCardChecklistsAsync(cardId, CancellationToken.None)) : null;
-                var memberTask = fetchMembers ? FetchSafeAsync(_cardsService.GetCardMembersAsync(cardId, CancellationToken.None)) : null;
-                var attachmentTask = fetchAttachments ? FetchSafeAsync(_cardsService.GetCardAttachmentsAsync(cardId, CancellationToken.None)) : null;
+                // Kick off each needed fetch independently. Each sub-task is
+                // individually wrapped: Task.WhenAll aborts on the FIRST fault,
+                // and an unwrapped attachment failure would discard
+                // already-fetched members/checklists for this card. Wrapped
+                // tasks always complete successfully (null on failure), so
+                // partial results are preserved.
+                var checklistTask = needChecklists
+                    ? FetchSafeAsync(_cardsService.GetCardChecklistsAsync(cardId, ct))
+                    : Task.FromResult<List<CardsChecklist>?>(null);
+                var memberTask = needMembers
+                    ? FetchSafeAsync(_cardsService.GetCardMembersAsync(cardId, ct))
+                    : Task.FromResult<List<CardsMember>?>(null);
+                var attachmentTask = needAttachments
+                    ? FetchSafeAsync(_cardsService.GetCardAttachmentsAsync(cardId, ct))
+                    : Task.FromResult<List<CardsAttachment>?>(null);
 
-                if (checklistTask is not null || memberTask is not null || attachmentTask is not null)
-                {
-                    await Task.WhenAll(
-                        checklistTask ?? Task.CompletedTask,
-                        memberTask ?? Task.CompletedTask,
-                        attachmentTask ?? Task.CompletedTask).ConfigureAwait(false);
+                await Task.WhenAll(checklistTask, memberTask, attachmentTask).ConfigureAwait(false);
 
-                    checklists = await (checklistTask ?? Task.FromResult<List<CardsChecklist>?>(null)) ?? [];
-                    members = await (memberTask ?? Task.FromResult<List<CardsMember>?>(null)) ?? [];
-                    attachments = await (attachmentTask ?? Task.FromResult<List<CardsAttachment>?>(null)) ?? [];
-                }
-
-                _detailCache[cardId] = (checklists, members, attachments);
+                checklists = await checklistTask.ConfigureAwait(false);
+                members = await memberTask.ConfigureAwait(false);
+                attachments = await attachmentTask.ConfigureAwait(false);
             }
             catch (Exception)
             {
-                // Transient failure: DO NOT cache empty results - that would
-                // permanently blank this card's details until a manual refresh.
-                // Removing the in-progress marker lets the next GetItems()
-                // (after the debounce) retry the fetch.
-                _detailCache.TryRemove(cardId, out _);
+                // Cancelled while waiting for its turn, or an unexpected
+                // failure - whatever was not fetched stays null and is
+                // handled as a failed kind below.
             }
-            finally
+
+            // Superseded by a manual refresh, or the page was disposed: the
+            // cache and the in-progress markers now belong to newer fetches.
+            if (ct.IsCancellationRequested)
+                return;
+
+            // Merge: a kind this run did not (successfully) fetch keeps
+            // whatever the cache already had for it.
+            _detailCache.AddOrUpdate(
+                cardId,
+                _ => new CardDetails(checklists, members, attachments),
+                (_, old) => new CardDetails(
+                    checklists ?? old.Checklists,
+                    members ?? old.Members,
+                    attachments ?? old.Attachments));
+
+            var anyFailed = (needChecklists && checklists is null)
+                || (needMembers && members is null)
+                || (needAttachments && attachments is null);
+            if (anyFailed)
             {
-                _detailFetchInProgress.TryRemove(cardId, out _);
-                // Debounce: collapse multiple detail-fetch completions into a single
-                // RaiseItemsChanged() call. Without this, N cards completing in quick
-                // succession each trigger a list rebuild → selection jumps (issue #48895)
-                // → intermittent Ctrl+Enter failures.
-                // Guarded: the page may have been disposed while this fetch was in
-                // flight - Timer.Change on a disposed timer throws ObjectDisposedException
-                // from this finally block (unobserved task exception).
-                try
-                {
-                    _detailRefreshDebounce.Change(TimeSpan.FromMilliseconds(500), Timeout.InfiniteTimeSpan);
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Page disposed - the refresh is moot.
-                }
+                _detailFetchFailedAt[cardId] = DateTime.UtcNow;
             }
+            else
+            {
+                _detailFetchFailedAt.TryRemove(cardId, out _);
+            }
+
+            _detailFetchInProgress.TryRemove(cardId, out _);
+            ScheduleDetailRefresh();
         });
+    }
+
+    /// <summary>
+    /// Schedules one list refresh for the detail fetches that just completed -
+    /// see _detailRefreshDebounce for the timing.
+    /// </summary>
+    private void ScheduleDetailRefresh()
+    {
+        var now = Environment.TickCount64;
+        var first = Interlocked.CompareExchange(ref _detailRefreshPendingSince, now, 0);
+        if (first == 0)
+        {
+            first = now;
+        }
+
+        var due = Math.Clamp(DetailRefreshMaxWaitMs - (now - first), 0, DetailRefreshQuietMs);
+
+        // Guarded: the page may have been disposed while a fetch was in
+        // flight - Timer.Change on a disposed timer throws.
+        try
+        {
+            _detailRefreshDebounce.Change(due, Timeout.Infinite);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Page disposed - the refresh is moot.
+        }
     }
 
     /// <summary>
@@ -603,7 +697,7 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
     ///   Position 1 (Ctrl+Enter) = Open in browser
     /// Separators do NOT count as positions for Enter/Ctrl+Enter.
     /// RequestedShortcut rules (verified against host source + #48725):
-    ///   - OK for idempotent InvokableCommands (KeepOpen): Ctrl+Up/Down move,
+    ///   - OK for idempotent InvokableCommands (KeepOpen): Alt+Up/Down move,
     ///     Ctrl+R refresh - double invocation (see below) is harmless.
     ///   - NEVER for commands that navigate to a Page: the host handles
     ///     TryCommandKeybindingMessage in BOTH ContextMenu and CommandBar
@@ -662,16 +756,16 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
         // pos change is synced from the command's card to the current _cards list
         // by ID. This handles the case where _cards was replaced by a background
         // reload (stale-check) after MoreCommands was cached.
-        cmds.Add(new CommandContextItem(new MoveCardUpCommand(_cardsService, card, _cards, () => OnCardPositionChanged(card)))
+        cmds.Add(new CommandContextItem(new MoveCardUpCommand(_cardsService, card, () => _cards, () => OnCardPositionChanged(card)))
         {
             Title = "Move up",
-            RequestedShortcut = KeyChordHelpers.FromModifiers(ctrl: true, vkey: VirtualKey.Up),
+            RequestedShortcut = KeyChordHelpers.FromModifiers(alt: true, vkey: VirtualKey.Up),
         });
 
-        cmds.Add(new CommandContextItem(new MoveCardDownCommand(_cardsService, card, _cards, () => OnCardPositionChanged(card)))
+        cmds.Add(new CommandContextItem(new MoveCardDownCommand(_cardsService, card, () => _cards, () => OnCardPositionChanged(card)))
         {
             Title = "Move down",
-            RequestedShortcut = KeyChordHelpers.FromModifiers(ctrl: true, vkey: VirtualKey.Down),
+            RequestedShortcut = KeyChordHelpers.FromModifiers(alt: true, vkey: VirtualKey.Down),
         });
 
         var moveCardPage = new MoveCardPage(card, _cardsService, _allListsOnBoard, LoadCardsInBackground);
@@ -752,7 +846,7 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
     public void LoadCardsInBackground()
     {
         IsLoading = true;
-        _errorMessage = string.Empty;
+        // _errorMessage is cleared on success only, so the error row stays while a retry runs.
 
         Task.Run(async () =>
         {
@@ -761,7 +855,7 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
                 var loaded = await _cardsService.GetCardsAsync(_list.Id, CancellationToken.None).ConfigureAwait(false);
                 // Sort by pos ascending so cards display in the correct order (top → bottom).
                 _cards = loaded.OrderBy(c => c.Pos).ToList();
-                _lastLoadTime = DateTime.UtcNow;
+                _errorMessage = string.Empty;
 
                 // Prune stale ListItem cache entries for cards no longer in the list
                 // (moved away, archived, or deleted). Keeps the cache from growing
@@ -782,6 +876,8 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
             }
             finally
             {
+                // Also set on failure: the stale check retries only after StaleThreshold.
+                _lastLoadTime = DateTime.UtcNow;
                 IsLoading = false;
                 // -2 = IncrementalRefresh → keepSelection=true.
                 // After a card move/copy/mark-complete, preserving selection keeps
@@ -790,6 +886,14 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
                 RaiseItemsChanged(-2);
             }
         });
+    }
+
+    private void RetryLoad()
+    {
+        if (!IsLoading)
+        {
+            LoadCardsInBackground();
+        }
     }
 
     /// <summary>
@@ -825,8 +929,11 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
     /// </summary>
     private void ManualRefresh()
     {
+        // Cancel pending detail fetches so they don't repopulate the cleared cache.
+        Interlocked.Exchange(ref _detailCts, new CancellationTokenSource()).Cancel();
         _detailCache.Clear();
         _detailFetchInProgress.Clear();
+        _detailFetchFailedAt.Clear();
         LoadCardsInBackground();
     }
 
@@ -1220,10 +1327,14 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
     }
 
     /// <summary>
-    /// Disposes the debounce timer. Called by the host when the page is cleaned up.
+    /// Cancels pending detail fetches and disposes the debounce timer. Called
+    /// by the host when the page is cleaned up.
     /// </summary>
     public void Dispose()
     {
+        var detailCts = Volatile.Read(ref _detailCts);
+        detailCts.Cancel();
+        detailCts.Dispose();
         _detailRefreshDebounce.Dispose();
         GC.SuppressFinalize(this);
     }

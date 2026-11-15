@@ -117,13 +117,21 @@ internal sealed partial class EditCardPage : ContentPage
             if (string.IsNullOrWhiteSpace(newTitle))
                 return CommandResult.KeepOpen();
 
+            // Send only changed fields (null = untouched); the form's copy of the card may be stale.
+            // Line endings are normalized for the comparison only: the multiline input may return "\r\n".
+            var titleToSend = newTitle != _card.Name ? newTitle : null;
             // Description is intentionally allowed to be empty - this clears the
             // description. The empty string is a valid, intentional value.
+            var descToSend = NormalizeNewlines(newDesc) != NormalizeNewlines(_card.Desc) ? newDesc : null;
+
+            if (titleToSend is null && descToSend is null)
+                return CommandResult.GoBack();
+
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    await _cardsService.UpdateCardAsync(_card.Id, newTitle, newDesc, CancellationToken.None).ConfigureAwait(false);
+                    await _cardsService.UpdateCardAsync(_card.Id, titleToSend, descToSend, CancellationToken.None).ConfigureAwait(false);
                     _onCompleted?.Invoke();
                 }
                 catch (Exception ex)
@@ -135,5 +143,8 @@ internal sealed partial class EditCardPage : ContentPage
 
             return CommandResult.GoBack();
         }
+
+        private static string NormalizeNewlines(string? text) =>
+            (text ?? string.Empty).Replace("\r\n", "\n").Replace('\r', '\n');
     }
 }

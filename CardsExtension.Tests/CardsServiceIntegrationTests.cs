@@ -172,6 +172,61 @@ public sealed class CardsServiceIntegrationTests
     }
 
     [Fact]
+    public async Task UpdateCardAsync_NullField_IsLeftOutOfTheBody()
+    {
+        // null = field left unchanged.
+        var (service, handler) = MakeService();
+        handler.Stub("PUT", "/1/cards/c1", (200, "{}"), (200, "{}"), (200, "{}"));
+
+        await service.UpdateCardAsync("c1", "Renamed", null);
+        await service.UpdateCardAsync("c1", null, "New description");
+        await service.UpdateCardAsync("c1", null, string.Empty);
+
+        Assert.Equal("{\"name\":\"Renamed\"}", handler.Requests[0].Body);
+        Assert.Equal("{\"desc\":\"New description\"}", handler.Requests[1].Body);
+        // An EMPTY description is a real value: it clears the description.
+        Assert.Equal("{\"desc\":\"\"}", handler.Requests[2].Body);
+    }
+
+    [Fact]
+    public async Task UpdateCardAsync_NothingToChange_MakesNoRequest()
+    {
+        var (service, handler) = MakeService();
+
+        await service.UpdateCardAsync("c1", null, null);
+
+        Assert.Empty(handler.Requests);
+    }
+
+    [Theory]
+    [InlineData(false, "is:open dev")]
+    [InlineData(true, "is:archived dev")]
+    public async Task SearchCardsOnBoardAsync_ScopesTheQueryOnTheServer(bool archived, string expectedQuery)
+    {
+        // Open/archived is part of the query; partial=true makes "dev" match "Development".
+        var (service, handler) = MakeService();
+        handler.Stub("GET", "/1/search", (200, """{ "cards": [ { "id": "c1", "name": "Development" } ] }"""));
+
+        var cards = await service.SearchCardsOnBoardAsync("  dev ", "b1", archived);
+
+        Assert.Equal("Development", Assert.Single(cards).Name);
+        var query = System.Web.HttpUtility.ParseQueryString(new Uri(Assert.Single(handler.Requests).Url).Query);
+        Assert.Equal(expectedQuery, query["query"]);
+        Assert.Equal("true", query["partial"]);
+        Assert.Equal("b1", query["idBoards"]);
+        Assert.Equal("cards", query["modelTypes"]);
+    }
+
+    [Fact]
+    public async Task SearchCardsOnBoardAsync_EmptyQuery_MakesNoRequest()
+    {
+        var (service, handler) = MakeService();
+
+        Assert.Empty(await service.SearchCardsOnBoardAsync("   ", "b1"));
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
     public async Task UpdateCommentAsync_PutsTextOnTheAction()
     {
         var (service, handler) = MakeService();

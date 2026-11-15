@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text.Json.Serialization;
 
 namespace CardsExtension.Models;
@@ -62,24 +63,26 @@ internal sealed class CardsCard
 
     // ── Computed display helpers ─────────────────────────────────────────────
 
-    /// <summary>True when the card has a due date that is in the past and not yet completed.</summary>
-    public bool IsOverdue
+    /// <summary>Parses <see cref="Due"/> into a UTC instant; a value without an offset is taken as UTC.</summary>
+    private bool TryGetDueUtc(out DateTime dueUtc)
     {
-        get
-        {
-            if (DueComplete || string.IsNullOrEmpty(Due)) return false;
-            return DateTime.TryParse(Due, out var due) && due < DateTime.UtcNow;
-        }
+        dueUtc = default;
+        if (string.IsNullOrEmpty(Due)) return false;
+        if (!DateTimeOffset.TryParse(Due, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var due)) return false;
+        dueUtc = due.UtcDateTime;
+        return true;
     }
+
+    /// <summary>True when the card has a due date that is in the past and not yet completed.</summary>
+    public bool IsOverdue => !DueComplete && TryGetDueUtc(out var dueUtc) && dueUtc < DateTime.UtcNow;
 
     /// <summary>Human-readable due-date label (date only) for display in subtitles.</summary>
     public string DueDisplay
     {
         get
         {
-            if (string.IsNullOrEmpty(Due)) return string.Empty;
-            if (!DateTime.TryParse(Due, out var due)) return string.Empty;
-            var local = due.ToLocalTime();
+            if (!TryGetDueUtc(out var dueUtc)) return string.Empty;
+            var local = dueUtc.ToLocalTime();
             return DueComplete
                 ? $"✓ Due {local:MMM d}"
                 : IsOverdue
@@ -93,9 +96,8 @@ internal sealed class CardsCard
     {
         get
         {
-            if (string.IsNullOrEmpty(Due)) return string.Empty;
-            if (!DateTime.TryParse(Due, out var due)) return string.Empty;
-            var local = due.ToLocalTime();
+            if (!TryGetDueUtc(out var dueUtc)) return string.Empty;
+            var local = dueUtc.ToLocalTime();
             return DueComplete
                 ? $"✓ Due {local:MMM d, h:mm tt}"
                 : IsOverdue

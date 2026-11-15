@@ -20,8 +20,9 @@ namespace CardsExtension.Pages;
 /// Results show card name + due date subtitle. Selecting a card opens it
 /// in the browser (OpenUrlCommand).
 ///
-/// The search API returns both open and archived cards. This page
-/// filters client-side based on the searchArchived parameter:
+/// The search API returns both open and archived cards by default. The
+/// searchArchived parameter is sent to the server as an is:open /
+/// is:archived operator (and re-checked client-side as a safety net):
 ///   false → only open (non-archived) cards
 ///   true  → only archived (closed) cards
 /// </summary>
@@ -91,9 +92,10 @@ internal sealed partial class SearchCardsPage : DynamicListPage, IDisposable
             {
                 // Small delay to debounce rapid typing - avoids hammering the API.
                 await Task.Delay(200, ct).ConfigureAwait(false);
-                var cards = await _cardsService.SearchCardsOnBoardAsync(search, _board.Id, ct).ConfigureAwait(false);
-                // Filter client-side: the search API returns both open and
-                // archived cards. Filter based on the _searchArchived flag.
+                var cards = await _cardsService.SearchCardsOnBoardAsync(search, _board.Id, _searchArchived, ct).ConfigureAwait(false);
+                // The open/archived restriction is applied by the server
+                // (is:open / is:archived operator); this client-side filter is
+                // only a safety net in case the operator is ever ignored.
                 _results = _searchArchived
                     ? cards.Where(c => c.Closed).ToList()
                     : cards.Where(c => !c.Closed).ToList();

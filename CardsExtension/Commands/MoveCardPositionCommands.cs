@@ -24,14 +24,15 @@ internal sealed partial class MoveCardUpCommand : InvokableCommand
 {
     private readonly CardsService _cardsService;
     private readonly CardsCard _card;
-    private readonly IReadOnlyList<CardsCard> _orderedCards;
+    // A provider because the page replaces its card list on reload while this command stays cached.
+    private readonly Func<IReadOnlyList<CardsCard>> _getOrderedCards;
     private readonly Action? _onCompleted;
 
-    public MoveCardUpCommand(CardsService cardsService, CardsCard card, IReadOnlyList<CardsCard> orderedCards, Action? onCompleted = null)
+    public MoveCardUpCommand(CardsService cardsService, CardsCard card, Func<IReadOnlyList<CardsCard>> getOrderedCards, Action? onCompleted = null)
     {
         _cardsService = cardsService;
         _card = card;
-        _orderedCards = orderedCards;
+        _getOrderedCards = getOrderedCards;
         _onCompleted = onCompleted;
         Name = "Move up";
         Icon = new IconInfo("\uE74A"); // Up icon
@@ -41,7 +42,7 @@ internal sealed partial class MoveCardUpCommand : InvokableCommand
     {
         // Sort cards by pos ascending (top → bottom) to ensure correct adjacency.
         // The API may not return cards in pos order, so we sort here.
-        var sortedCards = _orderedCards.OrderBy(c => c.Pos).ToList();
+        var sortedCards = _getOrderedCards().OrderBy(c => c.Pos).ToList();
 
         // Find the current card's index; the card above is at index-1.
         var currentIndex = -1;
@@ -126,14 +127,15 @@ internal sealed partial class MoveCardDownCommand : InvokableCommand
 {
     private readonly CardsService _cardsService;
     private readonly CardsCard _card;
-    private readonly IReadOnlyList<CardsCard> _orderedCards;
+    // A provider because the page replaces its card list on reload while this command stays cached.
+    private readonly Func<IReadOnlyList<CardsCard>> _getOrderedCards;
     private readonly Action? _onCompleted;
 
-    public MoveCardDownCommand(CardsService cardsService, CardsCard card, IReadOnlyList<CardsCard> orderedCards, Action? onCompleted = null)
+    public MoveCardDownCommand(CardsService cardsService, CardsCard card, Func<IReadOnlyList<CardsCard>> getOrderedCards, Action? onCompleted = null)
     {
         _cardsService = cardsService;
         _card = card;
-        _orderedCards = orderedCards;
+        _getOrderedCards = getOrderedCards;
         _onCompleted = onCompleted;
         Name = "Move down";
         Icon = new IconInfo("\uE74B"); // Down icon
@@ -143,7 +145,7 @@ internal sealed partial class MoveCardDownCommand : InvokableCommand
     {
         // Sort cards by pos ascending (top → bottom) to ensure correct adjacency.
         // The API may not return cards in pos order, so we sort here.
-        var sortedCards = _orderedCards.OrderBy(c => c.Pos).ToList();
+        var sortedCards = _getOrderedCards().OrderBy(c => c.Pos).ToList();
 
         // Find the current card's index; the card below is at index+1.
         var currentIndex = -1;

@@ -75,25 +75,26 @@ internal sealed partial class ListsPage : DynamicListPage
             ];
         }
 
+        // Lazy load + stale refresh: _lastLoadTime starts at DateTime.MinValue,
+        // so the FIRST GetItems() (user actually navigated here) triggers the
+        // load; revisits after 30s pick up external changes.
+        // Runs before the error check so a failed load is retried after StaleThreshold.
+        if (!IsLoading && DateTime.UtcNow - _lastLoadTime > StaleThreshold)
+        {
+            LoadListsInBackground();
+        }
+
         if (!string.IsNullOrEmpty(_errorMessage))
         {
             return
             [
-                new ListItem(new NoOpCommand())
+                new ListItem(new AnonymousCommand(RetryLoad) { Name = "Retry", Result = CommandResult.KeepOpen() })
                 {
                     Title = "Failed to load lists",
                     Subtitle = _errorMessage,
                     Icon = CardsIcon,
                 },
             ];
-        }
-
-        // Lazy load + stale refresh: _lastLoadTime starts at DateTime.MinValue,
-        // so the FIRST GetItems() (user actually navigated here) triggers the
-        // load; revisits after 30s pick up external changes.
-        if (!IsLoading && DateTime.UtcNow - _lastLoadTime > StaleThreshold)
-        {
-            LoadListsInBackground();
         }
 
         if (_lists.Count == 0 && !IsLoading)
@@ -128,8 +129,8 @@ internal sealed partial class ListsPage : DynamicListPage
 
             // "Search cards" actions - appear in the More (Ctrl+K) menu.
             // Two separate pages: one for open cards, one for archived cards.
-            // Both use GET /1/search?query=…&idBoards={boardId} and filter
-            // client-side based on the card's "closed" field.
+            // Both use GET /1/search?query=…&idBoards={boardId} with an
+            // is:open / is:archived operator in the query.
             var searchCardsPage = new SearchCardsPage(_cardsService, _board, searchArchived: false);
             var searchArchivedCardsPage = new SearchCardsPage(_cardsService, _board, searchArchived: true);
 
@@ -156,17 +157,25 @@ internal sealed partial class ListsPage : DynamicListPage
         return [.. items];
     }
 
+    private void RetryLoad()
+    {
+        if (!IsLoading)
+        {
+            LoadListsInBackground();
+        }
+    }
+
     private void LoadListsInBackground()
     {
         IsLoading = true;
-        _errorMessage = string.Empty;
+        // _errorMessage is cleared on success only, so the error row stays while a retry runs.
 
         Task.Run(async () =>
         {
             try
             {
                 _lists = await _cardsService.GetListsAsync(_board.Id, CancellationToken.None).ConfigureAwait(false);
-                _lastLoadTime = DateTime.UtcNow;
+                _errorMessage = string.Empty;
             }
             catch (Exception ex)
             {
@@ -175,6 +184,8 @@ internal sealed partial class ListsPage : DynamicListPage
             }
             finally
             {
+                // Also set on failure: the stale check retries only after StaleThreshold.
+                _lastLoadTime = DateTime.UtcNow;
                 IsLoading = false;
                 RaiseItemsChanged();
             }

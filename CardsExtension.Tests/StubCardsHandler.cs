@@ -24,22 +24,35 @@ internal sealed class StubCardsHandler : HttpMessageHandler
     /// </summary>
     public void Stub(string method, string path, params (int Status, string? Json)[] responses)
     {
-        _routes[$"{method.ToUpperInvariant()} {path}"] = new(responses.Select(r => ((HttpStatusCode)r.Status, r.Json)));
+        lock (Requests)
+        {
+            _routes[$"{method.ToUpperInvariant()} {path}"] = new(responses.Select(r => ((HttpStatusCode)r.Status, r.Json)));
+        }
     }
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         var body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
-        Requests.Add(new StubbedRequest(
-            request.Method.Method,
-            request.RequestUri!.ToString(),
-            body,
-            request.Headers.Authorization?.ToString()));
+        var key = $"{request.Method.Method} {request.RequestUri!.AbsolutePath}";
+        (HttpStatusCode Status, string? Json)? stubbed = null;
 
-        var key = $"{request.Method.Method} {request.RequestUri.AbsolutePath}";
-        if (_routes.TryGetValue(key, out var queue) && queue.Count > 0)
+        // Requests arrive from several background tasks; Requests doubles as the lock.
+        lock (Requests)
         {
-            var (status, json) = queue.Dequeue();
+            Requests.Add(new StubbedRequest(
+                request.Method.Method,
+                request.RequestUri.ToString(),
+                body,
+                request.Headers.Authorization?.ToString()));
+
+            if (_routes.TryGetValue(key, out var queue) && queue.Count > 0)
+            {
+                stubbed = queue.Dequeue();
+            }
+        }
+
+        if (stubbed is var (status, json))
+        {
             return new HttpResponseMessage(status)
             {
                 Content = json is null ? null : new StringContent(json, Encoding.UTF8, "application/json"),

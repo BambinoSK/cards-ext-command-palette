@@ -60,7 +60,8 @@ internal sealed partial class MoveCardPage : DynamicListPage
         {
             return
             [
-                new ListItem(new NoOpCommand())
+                // Enter retries.
+                new ListItem(new AnonymousCommand(RetryLoad) { Name = "Retry", Result = CommandResult.KeepOpen() })
                 {
                     Title = "Failed to load lists",
                     Subtitle = _errorMessage,
@@ -71,12 +72,19 @@ internal sealed partial class MoveCardPage : DynamicListPage
 
         // Use pre-populated list if available; otherwise use lazily fetched list.
         var source = _allListsPreloaded.Count > 0 ? _allListsPreloaded : _fetchedLists;
+        // DynamicListPage: the host does not filter, so the page filters by search text.
+        var search = SearchText?.Trim() ?? string.Empty;
         var items = new List<IListItem>();
+        var otherLists = 0;
 
         foreach (var list in source)
         {
             // Skip the list the card is already in.
             if (list.Id == _card.IdList) continue;
+            otherLists++;
+
+            if (!string.IsNullOrEmpty(search) && !list.Name.Contains(search, StringComparison.OrdinalIgnoreCase))
+                continue;
 
             items.Add(new ListItem(new MoveCardCommand(_cardsService, _card, list, _onMoved))
             {
@@ -87,10 +95,11 @@ internal sealed partial class MoveCardPage : DynamicListPage
 
         if (items.Count == 0 && !IsLoading)
         {
+            var filteredOut = otherLists > 0;
             items.Add(new ListItem(new NoOpCommand())
             {
-                Title = "No other lists available",
-                Subtitle = "This board only has one list",
+                Title = filteredOut ? "No matching lists" : "No other lists available",
+                Subtitle = filteredOut ? $"No list name contains \"{search}\"" : "This board only has one list",
                 Icon = new IconInfo("\uE8FD"), // BulletedList
             });
         }
@@ -105,13 +114,14 @@ internal sealed partial class MoveCardPage : DynamicListPage
     private void LoadListsInBackground()
     {
         IsLoading = true;
-        _errorMessage = string.Empty;
+        // _errorMessage is cleared on success only, so the error row stays while a retry runs.
 
         Task.Run(async () =>
         {
             try
             {
                 _fetchedLists = await _cardsService.GetListsAsync(_card.IdBoard, CancellationToken.None).ConfigureAwait(false);
+                _errorMessage = string.Empty;
             }
             catch (Exception ex)
             {
@@ -124,5 +134,13 @@ internal sealed partial class MoveCardPage : DynamicListPage
                 RaiseItemsChanged();
             }
         });
+    }
+
+    private void RetryLoad()
+    {
+        if (!IsLoading)
+        {
+            LoadListsInBackground();
+        }
     }
 }

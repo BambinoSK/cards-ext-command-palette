@@ -95,11 +95,12 @@ internal sealed partial class CardCommentsPage : DynamicListPage
             LoadCommentsInBackground();
         }
 
+        // Enter on the error row retries.
         if (!string.IsNullOrEmpty(_errorMessage))
         {
             return
             [
-                new ListItem(new NoOpCommand())
+                new ListItem(new AnonymousCommand(RetryLoad) { Name = "Retry", Result = CommandResult.KeepOpen() })
                 {
                     Title = "Failed to load comments",
                     Subtitle = _errorMessage,
@@ -392,7 +393,7 @@ internal sealed partial class CardCommentsPage : DynamicListPage
     public void LoadCommentsInBackground()
     {
         IsLoading = true;
-        _errorMessage = string.Empty;
+        // _errorMessage is cleared on success only, so the error row stays while a retry runs.
 
         Task.Run(async () =>
         {
@@ -400,7 +401,7 @@ internal sealed partial class CardCommentsPage : DynamicListPage
             {
                 var loaded = await _cardsService.GetCardCommentsAsync(_card.Id, CancellationToken.None).ConfigureAwait(false);
                 _comments = loaded;
-                _lastLoadTime = DateTime.UtcNow;
+                _errorMessage = string.Empty;
 
                 // Prune stale ListItem cache entries for comments that were deleted.
                 // Keeps the cache from growing unbounded and ensures the host doesn't
@@ -419,6 +420,8 @@ internal sealed partial class CardCommentsPage : DynamicListPage
             }
             finally
             {
+                // Also set on failure: the stale check retries only after StaleThreshold.
+                _lastLoadTime = DateTime.UtcNow;
                 IsLoading = false;
                 // -2 = IncrementalRefresh → keepSelection=true (same rationale as
                 // CardsPage: after an edit/delete the selection stays put and the
@@ -426,5 +429,13 @@ internal sealed partial class CardCommentsPage : DynamicListPage
                 RaiseItemsChanged(-2);
             }
         });
+    }
+
+    private void RetryLoad()
+    {
+        if (!IsLoading)
+        {
+            LoadCommentsInBackground();
+        }
     }
 }

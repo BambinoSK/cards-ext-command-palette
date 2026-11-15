@@ -210,16 +210,19 @@ internal sealed class CardsService
     // ── GET /1/search?query=…&idBoards={boardId} - Board-scoped card search ──
 
     /// <summary>
-    /// Searches for cards within a specific board.
+    /// Searches open or archived cards within a specific board.
     /// Verified endpoint: GET /1/search?query=…&modelTypes=cards&idBoards={boardId}&cards_limit=20
     /// The idBoards parameter restricts search results to the specified board.
     /// Verified from REST API OpenAPI spec: idBoards is a comma-separated
     /// list of board IDs to limit the search to.
+    /// The is:open / is:archived operator goes first so the user's last word stays last;
+    /// partial=true enables prefix matching ("dev" finds "Development").
     /// </summary>
-    public async Task<List<CardsCard>> SearchCardsOnBoardAsync(string query, string boardId, CancellationToken ct = default)
+    public async Task<List<CardsCard>> SearchCardsOnBoardAsync(string query, string boardId, bool archived = false, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(query)) return [];
-        var url = $"{BaseUrl}/search?query={Uri.EscapeDataString(query)}&modelTypes=cards&idBoards={Uri.EscapeDataString(boardId)}&cards_limit=20&card_fields=name,idList,idBoard,due,dueComplete,closed,shortUrl,url,labels,pos";
+        var scopedQuery = $"{(archived ? "is:archived" : "is:open")} {query.Trim()}";
+        var url = $"{BaseUrl}/search?query={Uri.EscapeDataString(scopedQuery)}&partial=true&modelTypes=cards&idBoards={Uri.EscapeDataString(boardId)}&cards_limit=20&card_fields=name,idList,idBoard,due,dueComplete,closed,shortUrl,url,labels,pos";
         var json = await GetStringAuthAsync(url, ct).ConfigureAwait(false);
         var result = JsonSerializer.Deserialize(json, CardsJsonContext.Default.CardsSearchResult);
         return result?.Cards ?? [];
@@ -368,14 +371,15 @@ internal sealed class CardsService
     /// fields you want to change is the documented pattern, and the docs allow
     /// query parameters to be replaced by a JSON body. desc may be an
     /// intentional empty string to clear the description.)
+    /// A null argument is omitted from the body (field left unchanged).
     /// </summary>
-    public async Task UpdateCardAsync(string cardId, string name, string desc, CancellationToken ct = default)
+    public async Task UpdateCardAsync(string cardId, string? name, string? desc, CancellationToken ct = default)
     {
-        var body = new JsonObject
-        {
-            ["name"] = name,
-            ["desc"] = desc,
-        };
+        var body = new JsonObject();
+        if (name is not null) body["name"] = name;
+        if (desc is not null) body["desc"] = desc;
+        if (body.Count == 0) return;
+
         using var response = await SendAuthJsonAsync($"{BaseUrl}/cards/{cardId}", HttpMethod.Put, body, ct).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
     }
