@@ -56,7 +56,7 @@ Browse and manage your Trello boards, lists and cards from PowerToys Command Pal
 | `Enter` | Open the selected board or list. |
 | `Ctrl` + `Enter` | Mark the selected card as complete (or incomplete again) |
 | `Ctrl` + `K` | All actions for the selected item |
-| `Alt` + `Up` / `Down` | Move card up or down |
+| `Ctrl` + `Up` / `Down` | Move card up or down |
 | `Ctrl` + `R` | Refresh the list |
 
 ## Requirements

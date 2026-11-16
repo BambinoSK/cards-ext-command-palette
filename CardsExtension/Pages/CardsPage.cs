@@ -697,7 +697,7 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
     ///   Position 1 (Ctrl+Enter) = Open in browser
     /// Separators do NOT count as positions for Enter/Ctrl+Enter.
     /// RequestedShortcut rules (verified against host source + #48725):
-    ///   - OK for idempotent InvokableCommands (KeepOpen): Alt+Up/Down move,
+    ///   - OK for idempotent InvokableCommands (KeepOpen): Ctrl+Up/Down move,
     ///     Ctrl+R refresh - double invocation (see below) is harmless.
     ///   - NEVER for commands that navigate to a Page: the host handles
     ///     TryCommandKeybindingMessage in BOTH ContextMenu and CommandBar
@@ -759,13 +759,13 @@ internal sealed partial class CardsPage : DynamicListPage, IDisposable
         cmds.Add(new CommandContextItem(new MoveCardUpCommand(_cardsService, card, () => _cards, () => OnCardPositionChanged(card)))
         {
             Title = "Move up",
-            RequestedShortcut = KeyChordHelpers.FromModifiers(alt: true, vkey: VirtualKey.Up),
+            RequestedShortcut = KeyChordHelpers.FromModifiers(ctrl: true, vkey: VirtualKey.Up),
         });
 
         cmds.Add(new CommandContextItem(new MoveCardDownCommand(_cardsService, card, () => _cards, () => OnCardPositionChanged(card)))
         {
             Title = "Move down",
-            RequestedShortcut = KeyChordHelpers.FromModifiers(alt: true, vkey: VirtualKey.Down),
+            RequestedShortcut = KeyChordHelpers.FromModifiers(ctrl: true, vkey: VirtualKey.Down),
         });
 
         var moveCardPage = new MoveCardPage(card, _cardsService, _allListsOnBoard, LoadCardsInBackground);
